@@ -352,8 +352,17 @@ func TestInitializer_MarkTaskAsFailed(t *testing.T) {
 	})
 
 	task := NewBootstrapTask("to-be-marked-failed", func(ctx context.Context) error {
-		time.Sleep(time.Hour) // Long sleep that we'll interrupt
-		return nil
+		// Long sleep that we'll interrupt. Honour ctx so the goroutine does not
+		// outlive this test: a task still sleeping here keeps its initializer
+		// alive across test boundaries, and attemptRemainingTasks (which holds
+		// i.tasksMu for its whole body) then deadlocks against a later test's
+		// Initializer.Stop waiting on the WaitGroup that body feeds.
+		select {
+		case <-time.After(time.Hour):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	})
 
 	// Start the task in a goroutine

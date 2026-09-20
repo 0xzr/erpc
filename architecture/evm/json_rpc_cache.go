@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"sync"
 	"time"
@@ -1316,11 +1315,12 @@ func (c *EvmJsonRpcCache) decompressValueBytes(compressedData []byte) ([]byte, e
 		return nil, fmt.Errorf("failed to reset zstd decoder: %w", err)
 	}
 
-	// Read all decompressed data
-	decompressed, err := io.ReadAll(decoder)
+	// Write decoded blocks directly, avoiding io.ReadAll's incremental slice copies.
+	var decompressed bytes.Buffer
+	_, err := decoder.WriteTo(&decompressed)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decompress value: %w", err)
 	}
 
-	return decompressed, nil
+	return decompressed.Bytes(), nil
 }

@@ -48,6 +48,8 @@ const (
 
 var _ common.EvmStatePoller = &EvmStatePoller{}
 
+var errNoHeadSample = errors.New("no valid head sample")
+
 type EvmStatePoller struct {
 	Enabled bool
 
@@ -56,7 +58,8 @@ type EvmStatePoller struct {
 	// and may be re-executed against an already-registered upstream). The
 	// ticker goroutine is bound to appCtx and has no other stop mechanism, so
 	// spawning a duplicate would poll the upstream forever.
-	started atomic.Bool
+	started        atomic.Bool
+	pollRetryAfter atomic.Int64
 
 	projectId    string
 	appCtx       context.Context
@@ -282,7 +285,37 @@ func (e *EvmStatePoller) SetNetworkConfig(cfg *common.NetworkConfig) {
 	}
 }
 
+func (e *EvmStatePoller) pollCoolingDown() bool {
+	return time.Now().UnixNano() < e.pollRetryAfter.Load()
+}
+
+// Honor explicit provider backpressure without slowing healthy upstreams.
+func (e *EvmStatePoller) recordPollRetryAfter(err error) {
+	var se common.StandardError
+	if !errors.As(err, &se) || !se.HasCode(common.ErrCodeEndpointCapacityExceeded) {
+		return
+	}
+	until := util.RetryAfter(err, time.Now())
+	if until.IsZero() {
+		return
+	}
+	deadline := until.UnixNano()
+	for {
+		previous := e.pollRetryAfter.Load()
+		if deadline <= previous {
+			return
+		}
+		if e.pollRetryAfter.CompareAndSwap(previous, deadline) {
+			e.logger.Debug().Time("retryAt", until).Msg("pausing evm state polling until upstream Retry-After expires")
+			return
+		}
+	}
+}
+
 func (e *EvmStatePoller) Poll(ctx context.Context) error {
+	if e.pollCoolingDown() {
+		return nil
+	}
 	var wg sync.WaitGroup
 	var errs []error
 	ermu := &sync.Mutex{}
@@ -449,6 +482,9 @@ func (e *EvmStatePoller) resolveDebounce(cfg *common.EvmNetworkConfig) time.Dura
 // PollLatestBlockNumber fetches the latest block number in a blocking manner.
 // Respects the debounce interval if configured (if the last poll happened too recently, it reuses the cached value).
 func (e *EvmStatePoller) PollLatestBlockNumber(ctx context.Context) (int64, error) {
+	if e.pollCoolingDown() {
+		return e.latestBlockShared.GetValue(), nil
+	}
 	if e.shouldSkipLatestBlockCheck() {
 		e.logger.Trace().Msg("skipping latest block number poll as it is not supported by the upstream")
 		return 0, nil
@@ -468,7 +504,7 @@ func (e *EvmStatePoller) PollLatestBlockNumber(ctx context.Context) (int64, erro
 	)
 	defer span.End()
 
-	return e.latestBlockShared.TryUpdateIfStale(ctx, dbi, func(ctx context.Context) (int64, error) {
+	value, err := e.latestBlockShared.TryUpdateIfStale(ctx, dbi, func(ctx context.Context) (int64, error) {
 		if e.logger.GetLevel() <= zerolog.TraceLevel {
 			e.logger.Trace().Str("ptr", fmt.Sprintf("%p", e)).Str("stack", string(debug.Stack())).Msg("fetching latest block number for evm state poller")
 		}
@@ -500,7 +536,7 @@ func (e *EvmStatePoller) PollLatestBlockNumber(ctx context.Context) (int64, erro
 					}
 				}
 				e.stateMu.Unlock()
-				return 0, nil
+				return 0, errNoHeadSample
 			} else {
 				e.logger.Warn().Err(err).Msg("failed to get latest block number in evm state poller")
 				return 0, err
@@ -516,7 +552,7 @@ func (e *EvmStatePoller) PollLatestBlockNumber(ctx context.Context) (int64, erro
 		// A major move must pass a fresh chain-identity check before entering
 		// the shared counter / tracker (see verifyChainIdOnMajorHeadMove).
 		if !e.verifyChainIdOnMajorHeadMove(ctx, "latest", e.latestBlockShared.GetValue(), blockNum) {
-			return 0, nil
+			return 0, errNoHeadSample
 		}
 
 		// Directly update tracker with the correct timestamp for this locally-fetched block
@@ -529,6 +565,10 @@ func (e *EvmStatePoller) PollLatestBlockNumber(ctx context.Context) (int64, erro
 			Msg("fetched latest block from upstream")
 		return blockNum, nil
 	})
+	if errors.Is(err, errNoHeadSample) {
+		return value, nil
+	}
+	return value, err
 }
 
 func (e *EvmStatePoller) SuggestLatestBlock(blockNumber int64) {
@@ -700,8 +740,12 @@ func (e *EvmStatePoller) verifyChainIdOnMajorHeadMove(ctx context.Context, tag s
 	if !ok {
 		return true
 	}
+	if e.pollCoolingDown() {
+		return false
+	}
 	detected, err := eu.EvmGetChainId(ctx)
 	if err != nil {
+		e.recordPollRetryAfter(err)
 		// The gRPC BDS client surfaces a cross-wired server as a typed
 		// mismatch (it compares the ChainId response itself) — treat that as
 		// proof, same as a differing answer below.
@@ -743,6 +787,9 @@ func absInt64(v int64) int64 {
 }
 
 func (e *EvmStatePoller) PollFinalizedBlockNumber(ctx context.Context) (int64, error) {
+	if e.pollCoolingDown() {
+		return e.finalizedBlockShared.GetValue(), nil
+	}
 	if e.shouldSkipFinalizedCheck() {
 		return 0, nil
 	}
@@ -761,7 +808,7 @@ func (e *EvmStatePoller) PollFinalizedBlockNumber(ctx context.Context) (int64, e
 
 	dbi := e.resolveDebounce(cfg)
 
-	return e.finalizedBlockShared.TryUpdateIfStale(ctx, dbi, func(ctx context.Context) (int64, error) {
+	value, err := e.finalizedBlockShared.TryUpdateIfStale(ctx, dbi, func(ctx context.Context) (int64, error) {
 		e.logger.Trace().Msg("fetching finalized block number for evm state poller")
 		telemetry.MetricUpstreamFinalizedBlockPolled.WithLabelValues(
 			e.projectId,
@@ -792,7 +839,7 @@ func (e *EvmStatePoller) PollFinalizedBlockNumber(ctx context.Context) (int64, e
 					}
 				}
 				e.stateMu.Unlock()
-				return 0, nil
+				return 0, errNoHeadSample
 			} else {
 				e.logger.Warn().Err(err).Msg("failed to get finalized block number in evm state poller")
 				return 0, err
@@ -807,7 +854,7 @@ func (e *EvmStatePoller) PollFinalizedBlockNumber(ctx context.Context) (int64, e
 
 		// Same chain-identity gate as the latest ratchet (see there).
 		if !e.verifyChainIdOnMajorHeadMove(ctx, "finalized", e.finalizedBlockShared.GetValue(), blockNum) {
-			return 0, nil
+			return 0, errNoHeadSample
 		}
 
 		e.logger.Debug().
@@ -818,6 +865,10 @@ func (e *EvmStatePoller) PollFinalizedBlockNumber(ctx context.Context) (int64, e
 
 		return blockNum, nil
 	})
+	if errors.Is(err, errNoHeadSample) {
+		return value, nil
+	}
+	return value, err
 }
 
 func (e *EvmStatePoller) SuggestFinalizedBlock(blockNumber int64) {
@@ -1295,6 +1346,7 @@ func (e *EvmStatePoller) fetchBlock(ctx context.Context, blockTag string) (int64
 		defer resp.Release()
 	}
 	if err != nil {
+		e.recordPollRetryAfter(err)
 		return 0, 0, err
 	}
 	jrr, err := resp.JsonRpcResponse()
@@ -1349,6 +1401,7 @@ func (e *EvmStatePoller) fetchSyncingState(ctx context.Context) (bool, error) {
 		defer resp.Release()
 	}
 	if err != nil {
+		e.recordPollRetryAfter(err)
 		if common.HasErrorCode(err,
 			common.ErrCodeUpstreamRequestSkipped,
 			common.ErrCodeUpstreamMethodIgnored,

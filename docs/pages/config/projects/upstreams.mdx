@@ -120,6 +120,22 @@ against a configured `evm.chainId` is fatal (no retry). A state-poller startup
 failure is not fatal — the upstream registers and availability checks fail-open
 until the poller recovers. (<SourceLink file="upstream/registry.go" lines="95-104" />)
 
+**Rate-limited EVM polling.** Capacity errors from head, syncing, or chain-identity
+checks with a valid future `Retry-After` pause that upstream's background poll
+cycle and explicit latest/finalized refreshes until the deadline. Both HTTP-date
+and delta-seconds are accepted; missing, invalid, expired, or overflowing values
+leave the cadence unchanged. Existing head values remain available without being
+marked fresh. Already-running requests may finish; other upstreams and normal
+client routing are unaffected. Polling resumes automatically, and concurrent
+responses can extend but never shorten the cooldown. The debug message
+`pausing evm state polling until upstream Retry-After expires` records `retryAt`.
+Bootstrap tasks also honor a valid `Retry-After` on failure, including automatic
+and request-triggered retries. Only the affected task waits; other tasks continue.
+
+Missing or chain-identity-rejected head samples leave the previous head intact;
+they are not submitted to the shared counter as block zero. The original
+verification warning remains visible without a duplicate non-positive-head warning.
+
 **Request path.** Before forwarding, `shouldSkip` runs in order: shadow upstreams
 skip real traffic → `evm.skipWhenSyncing` with a syncing poller → `ShouldHandleMethod`
 (ignore → allow with wildcard patterns, result cached per method forever) →

@@ -53,6 +53,7 @@ type BootstrapTask struct {
 	ctxCancel   atomic.Value                    // context.CancelFunc
 	doneVal     atomic.Value                    // chan struct{}
 	attempts    atomic.Int32
+	retryAfter  atomic.Int64
 }
 
 func NewBootstrapTask(name string, fn func(ctx context.Context) error) *BootstrapTask {
@@ -307,6 +308,11 @@ func (i *Initializer) attemptRemainingTasks(respectBackoff bool) {
 		t := value.(*BootstrapTask)
 		state := TaskState(t.state.Load())
 		if state == TaskPending || state == TaskFailed || state == TaskTimedOut {
+			// Provider cooldowns apply to automatic and request-triggered retries.
+			if time.Now().UnixNano() < t.retryAfter.Load() {
+				wg.Done()
+				return true
+			}
 			// Gate re-attempts of already-failed/timed-out tasks behind their
 			// retry backoff. ExecuteTasks (hence this function) runs on every
 			// request for a not-yet-ready network, so without this gate a
@@ -374,6 +380,9 @@ func (i *Initializer) attemptRemainingTasks(respectBackoff bool) {
 							bt.lastErr.Store(wrappedError{err: err})
 						} else {
 							bt.lastErr.CompareAndSwap(nil, wrappedError{err: err})
+						}
+						if until := RetryAfter(err, time.Now()); !until.IsZero() {
+							bt.retryAfter.Store(until.UnixNano())
 						}
 						bt.state.Store(int32(TaskFailed))
 						i.logger.Warn().Str("task", bt.Name).Err(err).Msg("initialization task failed")
